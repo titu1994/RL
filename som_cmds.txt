@@ -1,0 +1,35 @@
+# Force CUDA 12.9 toolchain for builds (matches torch cu129)
+export NEMO_RL_CUDA_HOME=/usr/local/cuda-12.9
+export CUDA_HOME=$NEMO_RL_CUDA_HOME
+export CUDA_PATH=$NEMO_RL_CUDA_HOME
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+export CPATH="/usr/include/x86_64-linux-gnu:${CPATH:-}"
+export LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:${LIBRARY_PATH:-}"
+export TORCH_CUDA_ARCH_LIST="9.0 10.0"
+
+
+# Rebuild worker venvs so they pick the corrected CUDA
+export NRL_FORCE_REBUILD_VENVS=true
+
+# Rebuild only the vllm worker
+rm -rf venvs/nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker
+rm -rf venvs/nemo_rl.environments.nemo_gym.NemoGym
+
+
+# Auto-load local NeMo RL env overrides
+
+## Create a local env file in repo root (not committed), e.g. .venv.local.env:
+export NEMO_RL_CUDA_HOME=/usr/local/cuda-12.9
+export CUDA_HOME="$NEMO_RL_CUDA_HOME"
+export CUDA_PATH="$NEMO_RL_CUDA_HOME"
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+export TORCH_CUDA_ARCH_LIST="9.0 10.0"
+
+
+## Update .venv/bin/activate
+
+if [ -f "$VIRTUAL_ENV/../.venv.local.env" ]; then
+  . "$VIRTUAL_ENV/../.venv.local.env"
+fi
