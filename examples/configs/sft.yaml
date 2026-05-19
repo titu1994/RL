@@ -13,6 +13,16 @@ sft:
   val_at_end: false
   seed: 42
 
+  # ECHO auxiliary loss for multi-turn agentic SFT.
+  # See https://github.com/microsoft/echo-rl. When `lambda_env > 0` and `env_roles`
+  # is non-empty, the SFT loss adds a length-normalized cross-entropy on tokens
+  # whose role appears in `env_roles` (typically `tool`/observation messages),
+  # sharing the same forward pass as the standard action-token NLL. The paper's
+  # suggested useful range is 0.01-0.05; lambda_env=0 (default) disables ECHO.
+  echo:
+    lambda_env: 0.0
+    env_roles: ["tool"]
+
 checkpointing:
   enabled: true
   checkpoint_dir: "results/sft"

@@ -21,6 +21,7 @@ from nemo_rl.algorithms.loss import (
     ClippedPGLossFn,
     DistillationLossFn,
     DPOLossFn,
+    EchoNLLLossFn,
     NLLLossFn,
     prepare_loss_input,
 )
@@ -113,6 +114,121 @@ def test_nll_loss():
     ## NLLLossFn averages the loss over unmasked tokens
     torch.testing.assert_close(loss.cpu(), torch.tensor(999.0))
     assert metrics_dict["num_unmasked_tokens"] == 2
+
+
+def _make_echo_test_inputs():
+    """Build a tiny CPU batch (B=2, S=6, V=4) for ECHO loss tests.
+
+    Token mask marks the last two positions of each sequence as action tokens.
+    Env mask marks the middle two positions of sequence 0 as env tokens; sequence
+    1 has no env tokens, which exercises the "no env tokens in this sample" path.
+    Returns ``(data, next_token_logprobs)`` where ``next_token_logprobs`` has
+    shape [B, S-1] (matching ``prepare_loss_input``'s contract for LOGPROB losses).
+    """
+    torch.manual_seed(0)
+    batch_size, seq_len, vocab = 2, 6, 4
+
+    input_ids = torch.randint(0, vocab, (batch_size, seq_len), dtype=torch.int64)
+    logits = torch.randn(batch_size, seq_len, vocab)
+    logprobs_all = torch.log_softmax(logits, dim=-1)
+    # Gather log p(input_ids[t+1] | ... ) for t = 0..S-2.
+    targets = input_ids[:, 1:].unsqueeze(-1)
+    next_token_logprobs = logprobs_all[:, :-1].gather(-1, targets).squeeze(-1)
+
+    token_mask = torch.zeros(batch_size, seq_len, dtype=torch.long)
+    token_mask[:, -2:] = 1  # last 2 positions per sequence are assistant
+    env_mask = torch.zeros(batch_size, seq_len, dtype=torch.long)
+    env_mask[0, 2:4] = 1  # middle 2 positions of seq 0 are env
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "token_mask": token_mask,
+            "sample_mask": torch.ones(batch_size),
+        }
+    )
+    data_with_env = BatchedDataDict(dict(data))
+    data_with_env["env_loss_mask"] = env_mask
+
+    global_valid_seqs = data["sample_mask"].sum()
+    global_valid_toks = (
+        data["token_mask"][:, 1:] * data["sample_mask"].unsqueeze(-1)
+    ).sum()
+    return (
+        data,
+        data_with_env,
+        next_token_logprobs,
+        global_valid_seqs,
+        global_valid_toks,
+    )
+
+
+def test_echo_nll_loss_matches_nll_when_env_mask_absent():
+    """``EchoNLLLossFn`` reduces exactly to ``NLLLossFn`` when no env mask is present."""
+    data, _, logprobs, gvs, gvt = _make_echo_test_inputs()
+
+    nll_loss, _ = NLLLossFn()(logprobs, data, gvs, gvt)
+    echo_loss, metrics = EchoNLLLossFn(lambda_env=0.5)(logprobs, data, gvs, gvt)
+
+    torch.testing.assert_close(echo_loss, nll_loss)
+    assert metrics["env_loss"] == 0.0
+    assert metrics["lambda_env"] == 0.5
+
+
+def test_echo_nll_loss_zero_lambda_matches_nll():
+    """``lambda_env=0`` makes the auxiliary term contribute 0 even with an env mask."""
+    _, data_with_env, logprobs, gvs, gvt = _make_echo_test_inputs()
+
+    nll_loss, _ = NLLLossFn()(logprobs, data_with_env, gvs, gvt)
+    echo_loss, metrics = EchoNLLLossFn(lambda_env=0.0)(
+        logprobs, data_with_env, gvs, gvt
+    )
+
+    torch.testing.assert_close(echo_loss, nll_loss)
+    # The env-prediction CE is still surfaced as a metric for diagnostics.
+    assert metrics["env_loss"] > 0.0
+    assert metrics["lambda_env"] == 0.0
+
+
+def test_echo_nll_loss_env_term_math():
+    """The env-loss term equals the manually-computed length-normalized CE."""
+    data, data_with_env, logprobs, gvs, gvt = _make_echo_test_inputs()
+
+    lambda_env = 0.1
+    sft_loss, _ = NLLLossFn()(logprobs, data, gvs, gvt)
+    echo_loss, metrics = EchoNLLLossFn(lambda_env=lambda_env)(
+        logprobs, data_with_env, gvs, gvt
+    )
+
+    # Manual env-loss: per-sequence -sum(logp * env_mask[:, 1:]) / |O|, averaged
+    # over global_valid_seqs (sequences with no env tokens contribute 0).
+    env_mask_shifted = data_with_env["env_loss_mask"][:, 1:].float()
+    per_seq_count = env_mask_shifted.sum(dim=-1).clamp(min=1.0)
+    per_seq_ce = -(logprobs * env_mask_shifted).sum(dim=-1) / per_seq_count
+    expected_env_loss = per_seq_ce.sum() / gvs.clamp(min=1.0)
+    expected_total = sft_loss + lambda_env * expected_env_loss
+
+    torch.testing.assert_close(
+        torch.tensor(metrics["env_loss"]), expected_env_loss
+    )
+    torch.testing.assert_close(echo_loss, expected_total)
+    assert metrics["env_tokens_total"] == 2  # only the two positions on seq 0
+
+
+def test_echo_nll_loss_all_zero_env_mask_is_noop():
+    """An all-zero env mask leaves the loss equal to the standard NLL."""
+    data, _, logprobs, gvs, gvt = _make_echo_test_inputs()
+    data_zero_env = BatchedDataDict(dict(data))
+    data_zero_env["env_loss_mask"] = torch.zeros_like(data["token_mask"])
+
+    nll_loss, _ = NLLLossFn()(logprobs, data, gvs, gvt)
+    echo_loss, metrics = EchoNLLLossFn(lambda_env=0.5)(
+        logprobs, data_zero_env, gvs, gvt
+    )
+
+    torch.testing.assert_close(echo_loss, nll_loss)
+    assert metrics["env_loss"] == 0.0
+    assert metrics["env_tokens_total"] == 0
 
 
 def test_dpo_loss():

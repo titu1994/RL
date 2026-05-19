@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.loss.loss_functions import NLLLossFn
+from nemo_rl.algorithms.loss.loss_functions import EchoNLLLossFn, NLLLossFn
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -50,6 +50,20 @@ class SFTSaveState(TypedDict):
     total_valid_tokens: int  # Track total number of non-padding tokens during training
 
 
+def _get_echo_env_roles(sft_config: "SFTConfig") -> Optional[list[str]]:
+    """Return ``env_roles`` from the ECHO SFT config if the auxiliary loss is enabled.
+
+    ECHO's environment mask is only attached to messages when both ``lambda_env > 0``
+    and ``env_roles`` is non-empty. Returning ``None`` here keeps the data path's
+    behavior byte-identical to a non-ECHO run.
+    """
+    echo_cfg = cast(EchoSFTConfig, sft_config.get("echo") or {})
+    if float(echo_cfg.get("lambda_env", 0.0)) <= 0.0:
+        return None
+    env_roles = list(echo_cfg.get("env_roles") or [])
+    return env_roles if env_roles else None
+
+
 def _default_sft_save_state() -> SFTSaveState:
     return {
         "epoch": 0,
@@ -58,6 +72,18 @@ def _default_sft_save_state() -> SFTSaveState:
         "consumed_samples": 0,
         "total_valid_tokens": 0,
     }
+
+
+class EchoSFTConfig(TypedDict, total=False):
+    """ECHO auxiliary-loss configuration for SFT (https://github.com/microsoft/echo-rl).
+
+    When ``lambda_env > 0`` and ``env_roles`` is non-empty, the SFT loss is augmented
+    with a length-normalized cross-entropy on tokens whose role is in ``env_roles``,
+    sharing the same forward pass as the standard action-token NLL.
+    """
+
+    lambda_env: float
+    env_roles: list[str]
 
 
 class SFTConfig(TypedDict):
@@ -72,6 +98,7 @@ class SFTConfig(TypedDict):
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
     val_at_end: bool
     seed: int
+    echo: NotRequired[EchoSFTConfig]
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -211,10 +238,23 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = NLLLossFn(
-        use_linear_ce_fusion=policy_config["megatron_cfg"]["enabled"]
+    echo_cfg = cast(EchoSFTConfig, sft_config.get("echo") or {})
+    echo_lambda = float(echo_cfg.get("lambda_env", 0.0))
+    echo_env_roles = list(echo_cfg.get("env_roles") or [])
+    use_linear_ce_fusion = (
+        policy_config["megatron_cfg"]["enabled"]
         and policy_config["megatron_cfg"]["use_linear_ce_fusion_loss"]
     )
+    if echo_lambda > 0.0 and echo_env_roles:
+        print(
+            f"  ✓ ECHO enabled (lambda_env={echo_lambda}, env_roles={echo_env_roles})"
+        )
+        loss_fn = EchoNLLLossFn(
+            lambda_env=echo_lambda,
+            use_linear_ce_fusion=use_linear_ce_fusion,
+        )
+    else:
+        loss_fn = NLLLossFn(use_linear_ce_fusion=use_linear_ce_fusion)
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
@@ -267,12 +307,15 @@ def validate(
         val_metrics = {"val_loss": 0.0}
         sum_num_valid_tokens = 0
 
+        echo_env_roles = _get_echo_env_roles(master_config.sft)
+
         policy.prepare_for_training()
         for batch_idx, val_batch in enumerate(val_dataloader):
             ## add loss mask based on role to every message
             add_loss_mask_to_message_log(
                 val_batch["message_log"],
                 roles_to_train_on=["assistant"],
+                env_roles=echo_env_roles,
             )
 
             cat_and_padded, input_lengths = batched_message_log_to_flat_message(
@@ -291,6 +334,8 @@ def validate(
                     "sample_mask": val_batch["loss_multiplier"],
                 }
             )
+            if "env_loss_mask" in cat_and_padded:
+                val_data["env_loss_mask"] = cat_and_padded["env_loss_mask"]
 
             # update multimodal data
             val_data.update(cat_and_padded.get_multimodal_dict(as_tensors=False))
@@ -394,6 +439,7 @@ def sft_train(
     val_at_start = sft_config["val_at_start"]
     val_at_end = sft_config["val_at_end"]
     max_num_epochs = sft_config["max_num_epochs"]
+    echo_env_roles = _get_echo_env_roles(sft_config)
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -436,6 +482,7 @@ def sft_train(
                     add_loss_mask_to_message_log(
                         batch["message_log"],
                         roles_to_train_on=["assistant"],
+                        env_roles=echo_env_roles,
                     )
 
                     cat_and_padded, input_lengths = batched_message_log_to_flat_message(
@@ -454,6 +501,8 @@ def sft_train(
                             "sample_mask": batch["loss_multiplier"],
                         }
                     )
+                    if "env_loss_mask" in cat_and_padded:
+                        train_data["env_loss_mask"] = cat_and_padded["env_loss_mask"]
                     train_data.update(
                         cat_and_padded.get_multimodal_dict(as_tensors=False)
                     )

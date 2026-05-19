@@ -614,6 +614,179 @@ def test_add_loss_mask_to_chat_message_log(
     )
 
 
+@pytest.fixture
+def tokenized_agentic_message_log() -> list[LLMMessageLogType]:
+    """Multi-turn agentic message log with assistant + tool turns."""
+    return [
+        [
+            {
+                "role": "system",
+                "content": "system message",
+                "token_ids": torch.tensor([0, 1, 2]),
+            },
+            {
+                "role": "user",
+                "content": "user message",
+                "token_ids": torch.tensor([3, 4]),
+            },
+            {
+                "role": "assistant",
+                "content": "assistant turn 1",
+                "token_ids": torch.tensor([5, 6, 7]),
+            },
+            {
+                "role": "tool",
+                "content": "tool output 1",
+                "token_ids": torch.tensor([8, 9, 10, 11]),
+            },
+            {
+                "role": "assistant",
+                "content": "assistant turn 2",
+                "token_ids": torch.tensor([12, 13]),
+            },
+            {
+                "role": "tool",
+                "content": "tool output 2",
+                "token_ids": torch.tensor([14, 15, 16]),
+            },
+        ]
+    ]
+
+
+def test_add_loss_mask_env_roles_basic(
+    tokenized_agentic_message_log: list[LLMMessageLogType],
+):
+    """``env_roles`` adds an ``env_loss_mask`` per message and leaves the existing
+    ``token_loss_mask`` for assistant tokens unchanged.
+    """
+    add_loss_mask_to_message_log(
+        tokenized_agentic_message_log,
+        roles_to_train_on=["assistant"],
+        env_roles=["tool"],
+    )
+    msgs = tokenized_agentic_message_log[0]
+
+    expected_action = [
+        torch.zeros(3, dtype=torch.long),  # system
+        torch.zeros(2, dtype=torch.long),  # user
+        torch.ones(3, dtype=torch.long),  # assistant
+        torch.zeros(4, dtype=torch.long),  # tool
+        torch.ones(2, dtype=torch.long),  # assistant
+        torch.zeros(3, dtype=torch.long),  # tool
+    ]
+    expected_env = [
+        torch.zeros(3, dtype=torch.long),  # system
+        torch.zeros(2, dtype=torch.long),  # user
+        torch.zeros(3, dtype=torch.long),  # assistant
+        torch.ones(4, dtype=torch.long),  # tool
+        torch.zeros(2, dtype=torch.long),  # assistant
+        torch.ones(3, dtype=torch.long),  # tool
+    ]
+
+    for msg, exp_action, exp_env in zip(msgs, expected_action, expected_env):
+        assert torch.equal(msg["token_loss_mask"], exp_action), (
+            f"action mask mismatch for role={msg['role']}"
+        )
+        assert torch.equal(msg["env_loss_mask"], exp_env), (
+            f"env mask mismatch for role={msg['role']}"
+        )
+        # action and env masks must be disjoint at the message level
+        assert (msg["token_loss_mask"] * msg["env_loss_mask"]).sum().item() == 0
+
+
+def test_add_loss_mask_env_roles_default_is_no_env_mask(
+    tokenized_agentic_message_log: list[LLMMessageLogType],
+):
+    """Without ``env_roles`` the call is byte-identical to today's behavior."""
+    add_loss_mask_to_message_log(
+        tokenized_agentic_message_log,
+        roles_to_train_on=["assistant"],
+    )
+    for msg in tokenized_agentic_message_log[0]:
+        assert "token_loss_mask" in msg
+        assert "env_loss_mask" not in msg
+
+
+def test_add_loss_mask_env_roles_case_insensitive(
+    tokenized_agentic_message_log: list[LLMMessageLogType],
+):
+    """Role matching for ``env_roles`` is case-insensitive on both sides."""
+    msgs = tokenized_agentic_message_log[0]
+    # Capitalize one of the tool roles in the input.
+    msgs[3]["role"] = "Tool"
+
+    add_loss_mask_to_message_log(
+        tokenized_agentic_message_log,
+        roles_to_train_on=["assistant"],
+        env_roles=["TOOL"],
+    )
+    assert msgs[3]["env_loss_mask"].sum().item() == msgs[3]["token_ids"].numel()
+    assert msgs[5]["env_loss_mask"].sum().item() == msgs[5]["token_ids"].numel()
+
+
+def test_add_loss_mask_env_roles_with_chat_template_scaffolding():
+    """End-to-end: a real Qwen-style chat template produces per-message ``token_ids``
+    that contain only message-body tokens (chat-template scaffolding lives in adjacent
+    system/assistant segments). Role-based env masking therefore selects observation
+    content cleanly, and the assistant and env masks remain disjoint.
+    """
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+
+    raw = [
+        {"role": "system", "content": "You are a helpful agent."},
+        {"role": "user", "content": "Run ls and report the result."},
+        {"role": "assistant", "content": "<tool_call>ls</tool_call>"},
+        {
+            "role": "tool",
+            "content": "README.md\nsrc\ntests\n",
+        },
+        {"role": "assistant", "content": "Three entries: README.md, src, tests."},
+    ]
+
+    task_data_spec = TaskDataSpec(task_name="echo_sft_test")
+    formatted = get_formatted_message_log(
+        raw,
+        tokenizer,
+        task_data_spec,
+        add_bos_token=False,
+        add_eos_token=False,
+    )
+
+    add_loss_mask_to_message_log(
+        [formatted],
+        roles_to_train_on=["assistant"],
+        env_roles=["tool"],
+    )
+
+    # Per-message invariants: action vs env masks are disjoint, and only the
+    # expected role has a non-zero mask of either kind.
+    for msg in formatted:
+        action_mask = msg["token_loss_mask"]
+        env_mask = msg["env_loss_mask"]
+        assert action_mask.shape == msg["token_ids"].shape
+        assert env_mask.shape == msg["token_ids"].shape
+        assert (action_mask * env_mask).sum().item() == 0
+        if msg["role"] == "assistant":
+            assert action_mask.all() and not env_mask.any()
+        elif msg["role"] == "tool":
+            assert env_mask.all() and not action_mask.any()
+        else:
+            assert not action_mask.any() and not env_mask.any()
+
+    # After flattening, env_loss_mask carries through unchanged.
+    flat, _ = batched_message_log_to_flat_message(
+        [formatted],
+        pad_value_dict={"token_ids": tokenizer.pad_token_id},
+    )
+    assert "env_loss_mask" in flat
+    tool_token_count = sum(
+        msg["token_ids"].numel() for msg in formatted if msg["role"] == "tool"
+    )
+    # The padded flat tensor may have trailing zeros; tool tokens are not on the
+    # right end so the sum of env_loss_mask equals the total tool-body token count.
+    assert int(flat["env_loss_mask"][0].sum().item()) == tool_token_count
+
+
 def test_get_first_index_that_differs():
     assert get_first_index_that_differs("hello", "hello") == 5
     assert get_first_index_that_differs("hello", "hello world") == 5

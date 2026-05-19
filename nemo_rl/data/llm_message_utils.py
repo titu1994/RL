@@ -145,6 +145,7 @@ def add_loss_mask_to_message_log(
     batch_message_log: list[LLMMessageLogType],
     roles_to_train_on: list[str] = ["assistant"],
     only_unmask_final: bool = False,
+    env_roles: Optional[list[str]] = None,
 ) -> None:
     """Add token-level loss masks to each message in a message log.
 
@@ -152,30 +153,39 @@ def add_loss_mask_to_message_log(
         message_log (LLMMessageLogType): List of message dictionaries containing token IDs and metadata
         roles_to_train_on (list[str]): List of strings indicating which speakers to unmask. Default: ["assistant"]
         only_unmask_final (bool): If True, only unmask the final message in the log. Default: False
+        env_roles (Optional[list[str]]): If provided, additionally attaches an ``env_loss_mask`` field
+            to every message that is 1 on tokens whose role appears in ``env_roles`` (case-insensitive)
+            and 0 elsewhere. This is used by ECHO-style auxiliary objectives that compute a
+            cross-entropy loss on environment/observation tokens in addition to the standard
+            action-token loss (see https://github.com/microsoft/echo-rl). Default: None (no
+            ``env_loss_mask`` is attached).
     """
     for i, role in enumerate(roles_to_train_on):
         roles_to_train_on[i] = role.lower()
 
+    env_roles_lower: Optional[set[str]] = (
+        {r.lower() for r in env_roles} if env_roles else None
+    )
+
     for message_log in batch_message_log:
         for i, message in enumerate(message_log):
+            ids = cast(Tensor, message["token_ids"])
             if only_unmask_final:
                 if i == len(message_log) - 1:
-                    message["token_loss_mask"] = torch.ones_like(
-                        cast(Tensor, message["token_ids"])
-                    )
+                    message["token_loss_mask"] = torch.ones_like(ids)
                 else:
-                    message["token_loss_mask"] = torch.zeros_like(
-                        cast(Tensor, message["token_ids"])
-                    )
+                    message["token_loss_mask"] = torch.zeros_like(ids)
             else:
                 if message["role"] in roles_to_train_on:
-                    message["token_loss_mask"] = torch.ones_like(
-                        cast(Tensor, message["token_ids"])
-                    )
+                    message["token_loss_mask"] = torch.ones_like(ids)
                 else:
-                    message["token_loss_mask"] = torch.zeros_like(
-                        cast(Tensor, message["token_ids"])
-                    )
+                    message["token_loss_mask"] = torch.zeros_like(ids)
+
+            if env_roles_lower is not None:
+                if message["role"].lower() in env_roles_lower:
+                    message["env_loss_mask"] = torch.ones_like(ids)
+                else:
+                    message["env_loss_mask"] = torch.zeros_like(ids)
 
 
 def _pad_tensor(

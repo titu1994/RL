@@ -681,6 +681,106 @@ class NLLLossFn(LossFunction):
         }
 
 
+class EchoNLLLossFn(NLLLossFn):
+    """ECHO-style NLL loss for multi-turn agentic SFT.
+
+    Combines the standard next-token NLL on action (e.g. ``assistant``) tokens with an
+    auxiliary cross-entropy loss on environment/observation tokens (e.g. ``tool`` role),
+    sharing the same forward pass and logits. This adapts the ECHO objective from
+    https://github.com/microsoft/echo-rl (originally proposed alongside GRPO) to SFT:
+
+    .. math::
+        L = L_\\text{action}(\\theta) + \\lambda \\cdot L_\\text{env}(\\theta)
+
+    where :math:`L_\\text{env}` is computed only on positions where ``data["env_loss_mask"]``
+    is 1, normalized per sequence by that sequence's total env-token count, then averaged
+    over the global valid-sequence count. The per-sequence normalization matches the
+    paper's :math:`Z=|\\mathcal{O}|` choice and makes the auxiliary term self-anneal as
+    the model learns environment dynamics.
+
+    When ``data["env_loss_mask"]`` is absent or all-zero, this reduces exactly to
+    :class:`NLLLossFn`. When ``lambda_env=0``, the env loss is computed only for metrics
+    and contributes 0 to the optimization objective.
+    """
+
+    def __init__(
+        self,
+        lambda_env: float = 0.05,
+        use_linear_ce_fusion: bool = False,
+    ):
+        super().__init__(use_linear_ce_fusion=use_linear_ce_fusion)
+        self.lambda_env = float(lambda_env)
+
+    def __call__(
+        self,
+        next_token_logprobs: Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: Tensor | None,
+        global_valid_toks: Tensor,
+        dpo_loss: bool = False,
+        dpo_average_log_probs: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        # Compute the standard NLL loss on action tokens via the parent class.
+        action_loss, metrics = super().__call__(
+            next_token_logprobs,
+            data,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            dpo_loss=dpo_loss,
+            dpo_average_log_probs=dpo_average_log_probs,
+        )
+
+        env_mask_full = data.get("env_loss_mask")
+        if env_mask_full is None:
+            metrics["sft_loss"] = (
+                action_loss.item() if action_loss.ndim == 0 else action_loss
+            )
+            metrics["env_loss"] = 0.0
+            metrics["env_tokens_per_seq"] = 0.0
+            metrics["lambda_env"] = self.lambda_env
+            return action_loss, metrics
+
+        # Align to next-token positions and gate by sample mask (matches NLLLossFn).
+        env_mask = (
+            env_mask_full[:, 1:] * data["sample_mask"].unsqueeze(-1)
+        ).to(next_token_logprobs.dtype)
+
+        # Per-sequence env-token count (|O| in the paper). Clamp avoids div-by-zero
+        # for sequences that contain no env tokens.
+        per_seq_env_count = env_mask.sum(dim=-1)
+        per_seq_env_count_safe = per_seq_env_count.clamp(min=1.0)
+
+        per_seq_env_nll = -(next_token_logprobs * env_mask).sum(dim=-1)
+        per_seq_env_ce = per_seq_env_nll / per_seq_env_count_safe
+
+        # Mean over globally-valid sequences. Sequences with zero env tokens contribute
+        # zero to the numerator (per_seq_env_nll==0); we keep them in the denominator
+        # so the metric is comparable across batches whose env-token coverage varies.
+        if global_valid_seqs is None:
+            denom = data["sample_mask"].sum().clamp(min=1.0)
+        else:
+            denom = global_valid_seqs.clamp(min=1.0)
+        env_loss = per_seq_env_ce.sum() / denom
+
+        total_loss = action_loss + self.lambda_env * env_loss
+
+        metrics["sft_loss"] = (
+            action_loss.item() if action_loss.ndim == 0 else action_loss
+        )
+        metrics["env_loss"] = env_loss.item()
+        metrics["env_tokens_total"] = per_seq_env_count.sum().item()
+        metrics["env_tokens_per_seq"] = (
+            per_seq_env_count.sum().item() / float(denom.item())
+            if denom.item() > 0
+            else 0.0
+        )
+        metrics["lambda_env"] = self.lambda_env
+        metrics["loss"] = (
+            total_loss.item() if total_loss.ndim == 0 else total_loss
+        )
+        return total_loss, metrics
+
+
 class PreferenceLossDataDict(TypedDict):
     """Required keys for the preference loss function."""
 
