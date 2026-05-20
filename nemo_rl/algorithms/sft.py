@@ -552,8 +552,26 @@ def sft_train(
                         {f"moe/{k}": v for k, v in train_results["moe_metrics"].items()}
                     )
                 metrics.update(train_results["all_mb_metrics"])
+                # `all_mb_metrics` entries are summed across microbatches × DP
+                # ranks by default; only per-mb constants and global counters
+                # are averaged. That's correct for partial losses (sft_loss /
+                # env_loss / loss are normalized such that the per-mb shares
+                # sum to the GBS-normalized total), but it makes the ECHO
+                # `lambda_env` metric -- a per-mb constant emitted by
+                # `EchoNLLLossFn` -- log as `lambda × (gbs / mbs)` (e.g.
+                # 0.05 × 64 = 3.2) instead of the configured 0.05. Treat it
+                # as a mean here. `env_tokens_per_seq` is similarly a per-mb
+                # mean and should also be averaged.
+                _mean_metrics = {
+                    "lr",
+                    "wd",
+                    "global_valid_seqs",
+                    "global_valid_toks",
+                    "lambda_env",
+                    "env_tokens_per_seq",
+                }
                 for k, v in metrics.items():
-                    if k in {"lr", "wd", "global_valid_seqs", "global_valid_toks"}:
+                    if k in _mean_metrics:
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
